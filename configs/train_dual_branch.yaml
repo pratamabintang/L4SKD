@@ -1,0 +1,39 @@
+# Dual-branch Attention U-Net training configuration for Landslide4Sense.
+# Encodes multispectral bands (B1-B12) and topographic bands (Slope, DEM) separately before fusion.
+
+# Data & normalization
+data_root: datasets/landslide4senses   # Dataset root directory
+bands: null                           # 0-based band indices, e.g. [1, 2, 3, 12, 13]; null = all 14 bands
+norm: l4s                             # Normalization mode: 'l4s' or 'none'
+stats_file: null                      # Optional JSON stats file; overrides norm when set
+train_list: null                      # Optional txt file filtering training sample IDs
+blacklist: null                       # Optional txt file of sample IDs (x in image_x.h5) to exclude across splits (e.g. datasets/landslide4senses/blacklist.txt)
+
+# Loss & metrics
+loss: dice                            # Loss function: 'dice', 'bce_dice', 'bce', 'structure', 'tversky', or 'focal_tversky'
+threshold: 0.5                        # Binary threshold for precision/recall/f1/iou
+
+# Model & optimization
+model: dual_branch                    # 'attention_unet', 'unet', or 'dual_branch'
+filters: 4                            # Base convolution filter count
+lr: 0.001                             # Adam learning rate
+batch_size: 8                         # Training and validation batch size
+epochs: 200                           # Maximum training epochs
+patience: 30                          # EarlyStopping patience on val_loss
+
+# Input pipeline
+augment: true                         # Joint random flips and 90-degree rotations
+color_jitter: true                    # Multispectral-only (B1-B12) brightness/contrast perturbation when augment is true (excludes Slope/DEM)
+color_brightness: 0.15                # Max additive per-band brightness delta
+color_contrast: 0.15                  # Max multiplicative per-band contrast delta ([1-c, 1+c])
+color_prob: 0.5                       # Probability of applying color perturbation per sample
+cache: true                           # Cache decoded samples in memory
+cache_file: null                      # Optional tf.data cache file path
+
+# Run output & reproducibility
+output_dir: runs                      # Base directory for run artifacts
+run_name: null                        # Custom run directory name (null = auto-generated)
+seed: 42                              # Random seed
+mixed_precision: false                # Enable Keras mixed_float16 policy
+deterministic: false                  # Enable TensorFlow op determinism (slower)
+eval_test: true                       # Evaluate best checkpoint on test split after training

@@ -1,0 +1,38 @@
+# Landslide-only (class1) training configuration with data augmentation enabled.
+
+# Data & normalization
+data_root: datasets/landslide4senses
+bands: null                                           # 0-based band indices, e.g. [1, 2, 3, 12, 13]; null = all 14 bands
+norm: l4s
+stats_file: null
+train_list: datasets/landslide4senses/class1_train.txt  # Train only on landslide-positive patches
+blacklist: null                                       # Optional txt file of sample IDs (x in image_x.h5) to exclude across splits (e.g. datasets/landslide4senses/blacklist.txt)
+
+# Loss & metrics
+loss: dice                                            # Loss function: 'dice', 'bce_dice', 'bce', 'structure', 'tversky', or 'focal_tversky'
+threshold: 0.5
+
+# Model & optimization
+model: attention_unet                 # 'attention_unet' or 'unet' (no attention gates)
+filters: 4
+lr: 0.001
+batch_size: 8
+epochs: 200
+patience: 30
+
+# Input pipeline
+augment: true
+color_jitter: true                    # Multispectral-only (B1-B12) brightness/contrast perturbation when augment is true (excludes Slope/DEM)
+color_brightness: 0.15                # Max additive per-band brightness delta
+color_contrast: 0.15                  # Max multiplicative per-band contrast delta ([1-c, 1+c])
+color_prob: 0.5                       # Probability of applying color perturbation per sample
+cache: true
+cache_file: null
+
+# Run output & reproducibility
+output_dir: runs
+run_name: attunet_class1
+seed: 42
+mixed_precision: false
+deterministic: false
+eval_test: true

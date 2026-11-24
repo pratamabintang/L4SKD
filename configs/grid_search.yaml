@@ -1,0 +1,36 @@
+# Hyperparameter grid search matching the original Attention_Unet_v1 notebook.
+
+# Data & normalization
+data_root: /content/datasets/landslide4senses/
+bands: [1, 2, 3, 13]                           # 0-based band indices, e.g. [1, 2, 3, 12, 13]; null = all 14 bands
+norm: l4s
+stats_file: null
+train_list: null
+blacklist: /content/datasets/landslide4senses/blacklist.txt                       # Optional txt file of sample IDs (x in image_x.h5) to exclude across splits (e.g. datasets/landslide4senses/blacklist.txt)
+
+# Loss & metrics
+loss: dice                            # Loss function: 'dice', 'bce_dice', 'bce', 'structure', 'tversky', or 'focal_tversky'
+threshold: 0.5
+
+# Grid search space
+model: dual_branch                 # 'attention_unet' or 'unet' (no attention gates)
+filters_list: [4, 32]
+lr_list: [0.01, 0.0005, 0.001, 0.00005, 0.0001]  # Notebook values: 10e-3, 5e-4, 10e-4, 5e-5, 10e-5
+batch_list: [4, 8, 16, 32]
+epochs: 200
+patience: 30
+
+# Input pipeline
+augment: true
+color_jitter: true                    # Multispectral-only (B1-B12) brightness/contrast perturbation when augment is true (excludes Slope/DEM)
+color_brightness: 0.15                # Max additive per-band brightness delta
+color_contrast: 0.15                  # Max multiplicative per-band contrast delta ([1-c, 1+c])
+color_prob: 0.5                       # Probability of applying color perturbation per sample
+cache: true
+cache_file: null
+
+# Run output & reproducibility
+output_dir: runs/grid_search_dual_branch
+seed: 42
+mixed_precision: false
+deterministic: false
