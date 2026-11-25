@@ -55,14 +55,43 @@ def default_attention_unet_channel_cfg(filters: int) -> dict[str, int]:
     }
 
 
+def _compute_nchw_ranks(nchw: np.ndarray, unit: str | None = None) -> np.ndarray:
+    """Compute per-sample, per-channel matrix ranks for an (B, C, H, W) tensor robustly."""
+    arr = np.asarray(nchw, dtype=np.float64)
+    if not np.all(np.isfinite(arr)):
+        label = f" for unit {unit!r}" if unit else ""
+        print(f"Warning: non-finite feature map values detected{label}; replacing with 0.0 for rank computation.")
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    try:
+        return np.linalg.matrix_rank(arr)
+    except np.linalg.LinAlgError:
+        from scipy.linalg import svd as scipy_svd
+
+        b, c = arr.shape[:2]
+        ranks = np.zeros((b, c), dtype=np.intp)
+        eps = np.finfo(np.float64).eps
+        for i in range(b):
+            for j in range(c):
+                mat = arr[i, j]
+                if not np.any(mat):
+                    continue
+                try:
+                    s = scipy_svd(mat, compute_uv=False, lapack_driver="gesvd")
+                except np.linalg.LinAlgError:
+                    s = scipy_svd(mat, compute_uv=False, lapack_driver="gesvd", check_finite=False)
+                tol = float(s.max()) * max(mat.shape) * eps
+                ranks[i, j] = int(np.sum(s > tol))
+        return ranks
+
+
 def compute_feature_ranks(feature_map: np.ndarray) -> np.ndarray:
     """Compute mean matrix rank across batch for an NHWC feature map -> shape (C,)."""
-    arr = np.asarray(feature_map, dtype=np.float32)
+    arr = np.asarray(feature_map, dtype=np.float64)
     if arr.ndim != 4:
         raise ValueError(f"Expected 4D NHWC tensor, got shape {arr.shape}.")
     # Move channels next to batch: (B, C, H, W) so matrix_rank operates over (H, W).
     nchw = np.transpose(arr, (0, 3, 1, 2))
-    ranks = np.linalg.matrix_rank(nchw)  # shape (B, C)
+    ranks = _compute_nchw_ranks(nchw)  # shape (B, C)
     return ranks.mean(axis=0, dtype=np.float64)
 
 
@@ -323,10 +352,10 @@ def collect_hrank_scores(
         batch_n = int(x.shape[0]) if x.shape[0] is not None else int(np.asarray(x).shape[0])
         feats = probe(x, training=False)
         for unit, feat in zip(PRUNABLE_UNITS, feats):
-            arr = np.asarray(feat, dtype=np.float32)
+            arr = np.asarray(feat, dtype=np.float64)
             # Compute mean rank per sample in batch, weighted by batch size for exact global mean.
             nchw = np.transpose(arr, (0, 3, 1, 2))
-            batch_sum = np.linalg.matrix_rank(nchw).sum(axis=0, dtype=np.float64)
+            batch_sum = _compute_nchw_ranks(nchw, unit=unit).sum(axis=0, dtype=np.float64)
             if unit not in rank_sums:
                 rank_sums[unit] = batch_sum
             else:
