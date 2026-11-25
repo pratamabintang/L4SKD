@@ -77,7 +77,13 @@ def export_logits(
             for imgs, _, _ in loader:
                 imgs = imgs.to(resolved_device)
                 out, _, _ = model(imgs)
-                logits_nhwc = out.permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.float16)
+                logits_f32 = out.permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.float32)
+                if not np.isfinite(logits_f32).all():
+                    n_bad = int((~np.isfinite(logits_f32)).sum())
+                    raise ValueError(
+                        f"Teacher produced {n_bad} non-finite logit values on split={split!r}."
+                    )
+                logits_nhwc = np.clip(logits_f32, -30.0, 30.0).astype(np.float16)
                 chunks.append(logits_nhwc)
 
         all_logits = np.concatenate(chunks, axis=0)

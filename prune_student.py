@@ -170,9 +170,11 @@ def prune_student(args: argparse.Namespace) -> dict[str, Any]:
             metrics=get_metrics(threshold=threshold),
         )
         val_eval = {
-            "source": {k: float(v) for k, v in src_model.evaluate(val_tf, return_dict=True).items()},
+            "source": {
+                k: float(v) for k, v in src_model.evaluate(val_tf, return_dict=True, verbose=0).items()
+            },
             "pruned_pre_finetune": {
-                k: float(v) for k, v in dst_model.evaluate(val_tf, return_dict=True).items()
+                k: float(v) for k, v in dst_model.evaluate(val_tf, return_dict=True, verbose=0).items()
             },
         }
 

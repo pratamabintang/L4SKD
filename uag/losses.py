@@ -98,12 +98,12 @@ def structure_loss(y_true, y_pred, kernel_size: int = 31, edge_weight: float = 5
     return tf.reduce_mean(wbce + wiou)
 
 
-def _pearson(a, b, eps: float = 1e-8):
+def _pearson(a, b, eps: float = 1e-6):
     a_centered = a - tf.reduce_mean(a, axis=1, keepdims=True)
     b_centered = b - tf.reduce_mean(b, axis=1, keepdims=True)
     num = tf.reduce_sum(a_centered * b_centered, axis=1)
-    norm_a = tf.sqrt(tf.reduce_sum(tf.square(a_centered), axis=1) + 1e-12)
-    norm_b = tf.sqrt(tf.reduce_sum(tf.square(b_centered), axis=1) + 1e-12)
+    norm_a = tf.sqrt(tf.reduce_sum(tf.square(a_centered), axis=1) + 1e-8)
+    norm_b = tf.sqrt(tf.reduce_sum(tf.square(b_centered), axis=1) + 1e-8)
     return num / (norm_a * norm_b + eps)
 
 
@@ -119,20 +119,33 @@ def dist_loss_binary(
     student_prob = tf.cast(student_prob, tf.float32)
     teacher_logit = tf.cast(teacher_logit, tf.float32)
 
-    p = tf.clip_by_value(student_prob, eps, 1.0 - eps)
-    z_s = tf.math.log(p) - tf.math.log1p(-p)
-    zeros = tf.zeros_like(z_s)
-
     tau_f = float(tau)
-    logits_s = tf.reshape(tf.concat([zeros, z_s], axis=-1) / tau_f, [-1, 2])
-    logits_t = tf.reshape(tf.concat([zeros, teacher_logit], axis=-1) / tau_f, [-1, 2])
+    t_clean = tf.where(
+        tf.math.is_finite(teacher_logit), teacher_logit, tf.zeros_like(teacher_logit)
+    )
+    t_clipped = tf.clip_by_value(t_clean, -30.0, 30.0)
+    p_t = tf.sigmoid(t_clipped / tau_f)
 
-    y_s = tf.nn.softmax(logits_s, axis=-1)
-    y_t = tf.nn.softmax(logits_t, axis=-1)
+    if tau_f == 1.0:
+        p_s = tf.clip_by_value(student_prob, 0.0, 1.0)
+    else:
+        p = tf.clip_by_value(student_prob, eps, 1.0 - eps)
+        z_s = tf.math.log(p) - tf.math.log1p(-p)
+        p_s = tf.sigmoid(z_s / tau_f)
 
-    inter = 1.0 - tf.reduce_mean(_pearson(y_s, y_t))
-    intra = 1.0 - tf.reduce_mean(_pearson(tf.transpose(y_s), tf.transpose(y_t)))
-    return (tau_f ** 2) * (float(beta) * inter + float(gamma) * intra)
+    y_s = tf.reshape(tf.concat([1.0 - p_s, p_s], axis=-1), [-1, 2])
+    y_t = tf.reshape(tf.concat([1.0 - p_t, p_t], axis=-1), [-1, 2])
+
+    beta_f = float(beta)
+    gamma_f = float(gamma)
+    total = tf.constant(0.0, dtype=tf.float32)
+    if beta_f != 0.0:
+        inter = 1.0 - tf.reduce_mean(_pearson(y_s, y_t))
+        total = total + beta_f * inter
+    if gamma_f != 0.0:
+        intra = 1.0 - tf.reduce_mean(_pearson(tf.transpose(y_s), tf.transpose(y_t)))
+        total = total + gamma_f * intra
+    return (tau_f ** 2) * total
 
 
 def make_kd_loss(

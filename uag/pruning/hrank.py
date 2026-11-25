@@ -55,15 +55,21 @@ def default_attention_unet_channel_cfg(filters: int) -> dict[str, int]:
     }
 
 
-def _compute_nchw_ranks(nchw: np.ndarray, unit: str | None = None) -> np.ndarray:
+def _compute_nchw_ranks(
+    nchw: np.ndarray,
+    unit: str | None = None,
+    warn: bool = True,
+) -> tuple[np.ndarray, bool]:
     """Compute per-sample, per-channel matrix ranks for an (B, C, H, W) tensor robustly."""
     arr = np.asarray(nchw, dtype=np.float64)
-    if not np.all(np.isfinite(arr)):
-        label = f" for unit {unit!r}" if unit else ""
-        print(f"Warning: non-finite feature map values detected{label}; replacing with 0.0 for rank computation.")
+    had_nonfinite = not np.all(np.isfinite(arr))
+    if had_nonfinite:
+        if warn:
+            label = f" for unit {unit!r}" if unit else ""
+            print(f"Warning: non-finite feature map values detected{label}; replacing with 0.0 for rank computation.")
         arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
     try:
-        return np.linalg.matrix_rank(arr)
+        return np.linalg.matrix_rank(arr), had_nonfinite
     except np.linalg.LinAlgError:
         from scipy.linalg import svd as scipy_svd
 
@@ -81,7 +87,7 @@ def _compute_nchw_ranks(nchw: np.ndarray, unit: str | None = None) -> np.ndarray
                     s = scipy_svd(mat, compute_uv=False, lapack_driver="gesvd", check_finite=False)
                 tol = float(s.max()) * max(mat.shape) * eps
                 ranks[i, j] = int(np.sum(s > tol))
-        return ranks
+        return ranks, had_nonfinite
 
 
 def compute_feature_ranks(feature_map: np.ndarray) -> np.ndarray:
@@ -91,7 +97,7 @@ def compute_feature_ranks(feature_map: np.ndarray) -> np.ndarray:
         raise ValueError(f"Expected 4D NHWC tensor, got shape {arr.shape}.")
     # Move channels next to batch: (B, C, H, W) so matrix_rank operates over (H, W).
     nchw = np.transpose(arr, (0, 3, 1, 2))
-    ranks = _compute_nchw_ranks(nchw)  # shape (B, C)
+    ranks, _ = _compute_nchw_ranks(nchw)  # shape (B, C)
     return ranks.mean(axis=0, dtype=np.float64)
 
 
@@ -343,6 +349,7 @@ def collect_hrank_scores(
     )
 
     rank_sums: dict[str, np.ndarray] = {}
+    nonfinite_units: list[str] = []
     total_samples = 0
 
     for batch_idx, batch in enumerate(tf_ds):
@@ -355,12 +362,21 @@ def collect_hrank_scores(
             arr = np.asarray(feat, dtype=np.float64)
             # Compute mean rank per sample in batch, weighted by batch size for exact global mean.
             nchw = np.transpose(arr, (0, 3, 1, 2))
-            batch_sum = _compute_nchw_ranks(nchw, unit=unit).sum(axis=0, dtype=np.float64)
+            ranks_bc, had_nf = _compute_nchw_ranks(nchw, unit=unit, warn=False)
+            if had_nf and unit not in nonfinite_units:
+                nonfinite_units.append(unit)
+            batch_sum = ranks_bc.sum(axis=0, dtype=np.float64)
             if unit not in rank_sums:
                 rank_sums[unit] = batch_sum
             else:
                 rank_sums[unit] += batch_sum
         total_samples += batch_n
+
+    if nonfinite_units:
+        print(
+            f"Warning: non-finite feature map values detected in units {nonfinite_units}; "
+            "replaced with 0.0 for HRank computation."
+        )
 
     if total_samples == 0:
         raise ValueError("Dataset yielded 0 batches; cannot compute HRank scores.")

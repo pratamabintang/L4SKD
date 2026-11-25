@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import h5py
+import numpy as np
 
 from uag.config import (
     IGNORED_KEYS,
@@ -125,6 +126,18 @@ def train(cfg: dict[str, Any]) -> dict[str, Any]:
                 )
         train_teacher_logits = load_teacher_logits(train_logits_path, train_ds_raw.ids)
         val_teacher_logits = load_teacher_logits(val_logits_path, val_ds_raw.ids)
+        for split_lbl, arr in (("train", train_teacher_logits), ("val", val_teacher_logits)):
+            finite_mask = np.isfinite(arr)
+            if not finite_mask.all():
+                n_bad = int((~finite_mask).sum())
+                raise ValueError(
+                    f"Teacher logits for {split_lbl!r} contain {n_bad} non-finite (NaN/Inf) values. "
+                    "Re-export clean teacher logits with export_teacher_logits.py before KD training."
+                )
+            print(
+                f"Teacher logits ({split_lbl}): shape={arr.shape}, "
+                f"range=[{float(arr.min()):.3f}, {float(arr.max()):.3f}]"
+            )
 
     train_tf_ds = make_tf_dataset(
         train_ds_raw,
@@ -247,13 +260,14 @@ def train(cfg: dict[str, Any]) -> dict[str, Any]:
     )
 
     callbacks = [
+        keras.callbacks.TerminateOnNaN(),
         keras.callbacks.ModelCheckpoint(
             filepath=str(weights_path),
             monitor=monitor,
             mode=monitor_mode,
             save_best_only=True,
             save_weights_only=True,
-            verbose=1,
+            verbose=0,
         ),
         keras.callbacks.EarlyStopping(
             monitor=monitor,
@@ -270,6 +284,7 @@ def train(cfg: dict[str, Any]) -> dict[str, Any]:
         validation_data=val_tf_ds,
         epochs=epochs,
         callbacks=callbacks,
+        verbose=2,
     )
 
     history_dict = {
@@ -310,7 +325,7 @@ def train(cfg: dict[str, Any]) -> dict[str, Any]:
             loss=get_loss(loss_name),
             metrics=get_metrics(threshold=threshold),
         )
-        raw_metrics = eval_model.evaluate(test_tf_ds, return_dict=True)
+        raw_metrics = eval_model.evaluate(test_tf_ds, return_dict=True, verbose=0)
         test_metrics = {k: float(v) for k, v in raw_metrics.items()}
         suite_acc = EvaluationSuiteAccumulator(
             threshold=threshold,

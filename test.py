@@ -84,7 +84,7 @@ def evaluate(
         metrics=get_metrics(threshold=eval_threshold),
     )
 
-    raw_metrics = model.evaluate(tf_ds, return_dict=True)
+    raw_metrics = model.evaluate(tf_ds, return_dict=True, verbose=0)
     metrics_out: dict[str, Any] = {k: float(v) for k, v in raw_metrics.items()}
 
     resolved_tau = float(iou_tau if iou_tau is not None else cfg.get("iou_tau", 0.5))
@@ -170,9 +170,9 @@ def resolve_eval_config(args: argparse.Namespace) -> tuple[dict[str, Any], Path,
         cfg["batch_size"] = args.batch_size
     if args.threshold_override is not None:
         cfg["threshold"] = args.threshold_override
-    if args.iou_tau_override is not None:
+    if getattr(args, "iou_tau_override", None) is not None:
         cfg["iou_tau"] = args.iou_tau_override
-    if args.dilation_alpha_override is not None:
+    if getattr(args, "dilation_alpha_override", None) is not None:
         cfg["dilation_alpha"] = args.dilation_alpha_override
     if args.model_override is not None:
         cfg["model"] = args.model_override
