@@ -15,6 +15,8 @@ from uag.data.landslide4sense import (
 from uag.losses import get_loss
 from uag.metrics import get_metrics
 from uag.models import build_model
+from uag.pruning.hrank import estimate_model_stats
+from uag.region_metrics import EvaluationSuiteAccumulator, format_evaluation_suite
 from uag.utils import load_json, parse_bands, save_json
 
 
@@ -24,7 +26,10 @@ def evaluate(
     split: str = "test",
     threshold: Optional[float] = None,
     exclude_list: Optional[str | Path] = None,
-) -> dict[str, float]:
+    iou_tau: Optional[float] = None,
+    dilation_alpha: Optional[float] = None,
+    per_patch_csv: Optional[str | Path] = None,
+) -> dict[str, Any]:
     """Build model, load weights, and evaluate on the specified split."""
     from tensorflow import keras
 
@@ -71,6 +76,7 @@ def evaluate(
         filters=filters,
         pretrained_weights=str(weights),
         bands=bands,
+        channel_cfg=cfg.get("channel_cfg"),
     )
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=lr),
@@ -79,7 +85,34 @@ def evaluate(
     )
 
     raw_metrics = model.evaluate(tf_ds, return_dict=True)
-    return {k: float(v) for k, v in raw_metrics.items()}
+    metrics_out: dict[str, Any] = {k: float(v) for k, v in raw_metrics.items()}
+
+    resolved_tau = float(iou_tau if iou_tau is not None else cfg.get("iou_tau", 0.5))
+    resolved_alpha = float(
+        dilation_alpha if dilation_alpha is not None else cfg.get("dilation_alpha", 0.1)
+    )
+    acc = EvaluationSuiteAccumulator(
+        threshold=eval_threshold,
+        tau=resolved_tau,
+        alpha=resolved_alpha,
+    )
+    offset = 0
+    for batch_x, batch_y in tf_ds:
+        preds = model(batch_x, training=False)
+        b_size = int(preds.shape[0]) if preds.shape[0] is not None else int(batch_y.shape[0])
+        batch_ids = ds_raw.ids[offset : offset + b_size]
+        acc.update_batch(preds.numpy(), batch_y.numpy(), sample_ids=batch_ids)
+        offset += b_size
+    metrics_out.update(acc.compute())
+
+    weights_size_mb = round(Path(weights).stat().st_size / (1024 * 1024), 4)
+    metrics_out["model_cost"] = {
+        **estimate_model_stats(model),
+        "weights_size_mb": weights_size_mb,
+    }
+    if per_patch_csv is not None:
+        acc.save_per_patch_csv(per_patch_csv)
+    return metrics_out
 
 
 def resolve_eval_config(args: argparse.Namespace) -> tuple[dict[str, Any], Path, Path]:
@@ -108,6 +141,8 @@ def resolve_eval_config(args: argparse.Namespace) -> tuple[dict[str, Any], Path,
         "stats_file": None,
         "loss": "dice",
         "threshold": 0.5,
+        "iou_tau": 0.5,
+        "dilation_alpha": 0.1,
         "model": "attention_unet",
         "blacklist": None,
         "filters": 4,
@@ -135,6 +170,10 @@ def resolve_eval_config(args: argparse.Namespace) -> tuple[dict[str, Any], Path,
         cfg["batch_size"] = args.batch_size
     if args.threshold_override is not None:
         cfg["threshold"] = args.threshold_override
+    if args.iou_tau_override is not None:
+        cfg["iou_tau"] = args.iou_tau_override
+    if args.dilation_alpha_override is not None:
+        cfg["dilation_alpha"] = args.dilation_alpha_override
     if args.model_override is not None:
         cfg["model"] = args.model_override
     if args.blacklist_override is not None:
@@ -157,6 +196,8 @@ def build_parser() -> argparse.ArgumentParser:
         norm_override=None,
         loss_override=None,
         threshold_override=None,
+        iou_tau_override=None,
+        dilation_alpha_override=None,
         model_override=None,
         blacklist_override=None,
     )
@@ -177,6 +218,10 @@ def _parse_with_overrides(parser: argparse.ArgumentParser) -> argparse.Namespace
         args.loss_override = args.loss
     if "--threshold" in argv or any(a.startswith("--threshold=") for a in argv):
         args.threshold_override = args.threshold
+    if "--iou-tau" in argv or any(a.startswith("--iou-tau=") for a in argv):
+        args.iou_tau_override = args.iou_tau
+    if "--dilation-alpha" in argv or any(a.startswith("--dilation-alpha=") for a in argv):
+        args.dilation_alpha_override = args.dilation_alpha
     if "--model" in argv or any(a.startswith("--model=") for a in argv):
         args.model_override = args.model
     if "--blacklist" in argv or any(a.startswith("--blacklist=") for a in argv):
@@ -188,16 +233,29 @@ def main() -> None:
     parser = build_parser()
     args = _parse_with_overrides(parser)
     cfg, weights_path, out_dir = resolve_eval_config(args)
+    per_patch_path = out_dir / f"per_patch_{args.split}.csv"
     metrics = evaluate(
         cfg=cfg,
         weights=weights_path,
         split=args.split,
         threshold=cfg.get("threshold", 0.5),
         exclude_list=cfg.get("blacklist"),
+        iou_tau=cfg.get("iou_tau", 0.5),
+        dilation_alpha=cfg.get("dilation_alpha", 0.1),
+        per_patch_csv=per_patch_path,
     )
     print(f"Evaluation metrics ({args.split}):")
     for key, val in metrics.items():
-        print(f"  {key}: {val:.6f}")
+        if isinstance(val, (int, float)):
+            print(f"  {key}: {val:.6f}")
+    if "region_sufficiency" in metrics and "standard_overlap" in metrics:
+        print(format_evaluation_suite(metrics))
+    if "model_cost" in metrics:
+        mc = metrics["model_cost"]
+        print(
+            f"Model cost: params={mc['params']:,}, flops={mc['flops']:,}, "
+            f"weights_size_mb={mc['weights_size_mb']:.4f}"
+        )
     save_json(metrics, out_dir / f"metrics_{args.split}.json")
 
 

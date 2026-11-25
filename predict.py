@@ -175,6 +175,7 @@ def main() -> None:
         filters=filters,
         pretrained_weights=str(weights_path),
         bands=bands,
+        channel_cfg=cfg.get("channel_cfg"),
     )
 
     for start in range(0, total, batch_size):

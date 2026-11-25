@@ -197,6 +197,32 @@ def read_mask(path: str | Path) -> np.ndarray:
     return np.ascontiguousarray(mask, dtype=np.float32)
 
 
+def load_teacher_logits(path: str | Path, ids: Sequence[str]) -> np.ndarray:
+    """Load exported teacher logits (H, W, 1) aligned to the requested sample IDs."""
+    h5_path = Path(path)
+    if not h5_path.is_file():
+        raise FileNotFoundError(f"Teacher logits file not found: {h5_path}")
+
+    with h5py.File(h5_path, "r") as f:
+        raw_ids = f["ids"][()]
+        stored_ids = [
+            item.decode("utf-8") if isinstance(item, (bytes, bytearray)) else str(item)
+            for item in raw_ids
+        ]
+        id_to_row = {stem: i for i, stem in enumerate(stored_ids)}
+        missing = [stem for stem in ids if stem not in id_to_row]
+        if missing:
+            raise KeyError(
+                f"Teacher logits file {h5_path} is missing {len(missing)} sample IDs "
+                f"(first missing: {missing[:5]})"
+            )
+        rows = [id_to_row[stem] for stem in ids]
+        all_logits = f["logits"][()]
+
+    selected = all_logits[rows].astype(np.float16, copy=False)
+    return np.ascontiguousarray(selected, dtype=np.float16)
+
+
 class Normalizer:
     """Per-band channel standardization."""
 
@@ -374,6 +400,7 @@ def make_tf_dataset(
     color_brightness: float = 0.15,
     color_contrast: float = 0.15,
     color_prob: float = 0.5,
+    teacher_logits: Optional[np.ndarray] = None,
 ):
     """Build a tf.data.Dataset from a Landslide4SenseDataset."""
     import tensorflow as tf
@@ -390,6 +417,21 @@ def make_tf_dataset(
         raise ValueError(f"color_prob must be in [0.0, 1.0], got {color_prob}")
 
     height, width, channels = ds.image_shape
+    if teacher_logits is not None:
+        if teacher_logits.ndim != 4 or teacher_logits.shape[3] != 1:
+            raise ValueError(
+                f"teacher_logits must have shape (N, H, W, 1), got {teacher_logits.shape}."
+            )
+        if len(teacher_logits) != len(ds):
+            raise ValueError(
+                f"teacher_logits length ({len(teacher_logits)}) != dataset length ({len(ds)})."
+            )
+        if teacher_logits.shape[1:3] != (height, width):
+            raise ValueError(
+                f"teacher_logits spatial shape {teacher_logits.shape[1:3]} != ({height}, {width})."
+            )
+    target_ch = 2 if teacher_logits is not None else 1
+
     ms_mask_np = get_multispectral_channel_mask(ds.bands)
     apply_color_jitter = bool(
         color_jitter
@@ -400,15 +442,19 @@ def make_tf_dataset(
     ms_mask_tf = tf.constant(ms_mask_np > 0.5, dtype=tf.bool)
 
     def _py_load(idx_tensor) -> tuple[np.ndarray, np.ndarray]:
-        img, mask = ds[int(idx_tensor)]
+        sample_idx = int(idx_tensor)
+        img, mask = ds[sample_idx]
         if mask is None:
             raise ValueError("Sample returned None mask.")
+        if teacher_logits is not None:
+            t_logit = teacher_logits[sample_idx].astype(np.float32, copy=False)
+            mask = np.concatenate([mask, t_logit], axis=-1)
         return img, mask
 
     def _load(idx):
         img, mask = tf.numpy_function(_py_load, [idx], [tf.float32, tf.float32])
         img.set_shape((height, width, channels))
-        mask.set_shape((height, width, 1))
+        mask.set_shape((height, width, target_ch))
         return img, mask
 
     def _augment(img, mask):
@@ -454,7 +500,7 @@ def make_tf_dataset(
                 aug_img = tf.cond(do_jitter, _perturb_color, lambda: aug_img)
 
         aug_img.set_shape((height, width, channels))
-        aug_mask.set_shape((height, width, 1))
+        aug_mask.set_shape((height, width, target_ch))
         return aug_img, aug_mask
 
     pipeline = tf.data.Dataset.range(len(ds))

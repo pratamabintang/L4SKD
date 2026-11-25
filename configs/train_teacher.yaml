@@ -1,0 +1,33 @@
+# SAM2-UNet teacher training configuration for Landslide4Sense (RGB only).
+
+# Data & normalization
+data_root: /content/datasets/landslide4senses/   # Dataset root directory
+bands: [3, 2, 1]                                # 0-based RGB band indices (B4=R, B3=G, B2=B)
+norm: l4s                                       # Normalization mode: 'l4s' or 'none'
+stats_file: null                                # Optional JSON stats file; overrides norm when set
+train_list: null                                # Optional txt file filtering training sample IDs
+blacklist: /content/datasets/landslide4senses/blacklist.txt  # Sample IDs to exclude across splits
+
+# Teacher architecture
+sam2_cfg: sam2_hiera_l.yaml                     # SAM2 backbone config ('t', 's', 'b+', 'l', or YAML name)
+sam2_checkpoint: checkpoints/sam2_hiera_large.pt  # Pretrained SAM2 checkpoint path
+input_size: 352                                 # Teacher square input size (divisible by 32)
+
+# Optimization & metrics
+threshold: 0.5                                  # Binary threshold for precision/recall/f1/iou
+batch_size: 12                                  # Training and validation batch size
+lr: 0.001                                       # AdamW initial learning rate
+weight_decay: 0.0001                            # AdamW weight decay
+epochs: 50                                      # CosineAnnealingLR epochs
+patience: 0                                     # EarlyStopping patience on val_f1_score (0 disables)
+augment: true                                   # Joint random flips and 90-degree rotations
+amp: true                                       # PyTorch CUDA automatic mixed precision
+num_workers: 2                                  # PyTorch DataLoader workers
+device: auto                                    # 'auto', 'cuda', or 'cpu'
+
+# Run output, evaluation & export
+output_dir: runs                                # Base directory for run artifacts
+run_name: sam2unet_l_rgb                        # Custom run directory name (null = auto-generated)
+seed: 42                                        # Random seed
+eval_test: true                                 # Evaluate best checkpoint on test split after training
+export_logits: true                             # Export teacher_logits_<split>.h5 after training

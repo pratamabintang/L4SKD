@@ -8,6 +8,8 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 
+from uag.pruning.hrank import default_attention_unet_channel_cfg
+
 KINIT = "glorot_normal"
 
 
@@ -28,10 +30,11 @@ class RepeatChannels(layers.Layer):
         return config
 
 
-def unet_conv2d(x, outdim: int, is_batchnorm: bool, name: str):
+def unet_conv2d(x, outdim: int, is_batchnorm: bool, name: str, mid_dim: Optional[int] = None):
     """Two-layer 3x3 Conv2D block with optional BatchNorm and ReLU."""
+    first_dim = int(mid_dim) if mid_dim is not None else int(outdim)
     x = layers.Conv2D(
-        outdim,
+        first_dim,
         (3, 3),
         strides=(1, 1),
         kernel_initializer=KINIT,
@@ -129,6 +132,7 @@ def build_attention_unet(
     filters: int = 4,
     pretrained_weights: Optional[str] = None,
     name: str = "attention_unet",
+    channel_cfg: Optional[dict[str, int]] = None,
 ) -> keras.Model:
     """Build an uncompiled Attention U-Net model matching the original notebook architecture."""
     height, width, _ = input_shape
@@ -137,28 +141,29 @@ def build_attention_unet(
             f"Input height and width must be divisible by 16, got {input_shape[:2]}."
         )
 
+    ch = {**default_attention_unet_channel_cfg(filters), **(channel_cfg or {})}
     inputs = keras.Input(shape=input_shape)
 
-    conv1 = unet_conv2d(inputs, filters, is_batchnorm=True, name="conv1")
+    conv1 = unet_conv2d(inputs, ch["conv1_2"], is_batchnorm=True, name="conv1", mid_dim=ch["conv1_1"])
     pool1 = layers.MaxPooling2D(pool_size=(2, 2))(conv1)
 
-    conv2 = unet_conv2d(pool1, filters, is_batchnorm=True, name="conv2")
+    conv2 = unet_conv2d(pool1, ch["conv2_2"], is_batchnorm=True, name="conv2", mid_dim=ch["conv2_1"])
     pool2 = layers.MaxPooling2D(pool_size=(2, 2))(conv2)
 
-    conv3 = unet_conv2d(pool2, filters * 2, is_batchnorm=True, name="conv3")
+    conv3 = unet_conv2d(pool2, ch["conv3_2"], is_batchnorm=True, name="conv3", mid_dim=ch["conv3_1"])
     pool3 = layers.MaxPooling2D(pool_size=(2, 2))(conv3)
 
-    conv4 = unet_conv2d(pool3, filters * 2, is_batchnorm=True, name="conv4")
+    conv4 = unet_conv2d(pool3, ch["conv4_2"], is_batchnorm=True, name="conv4", mid_dim=ch["conv4_1"])
     pool4 = layers.MaxPooling2D(pool_size=(2, 2))(conv4)
 
-    center = unet_conv2d(pool4, filters * 4, is_batchnorm=True, name="center")
+    center = unet_conv2d(pool4, ch["center_2"], is_batchnorm=True, name="center", mid_dim=ch["center_1"])
 
     g1 = unet_gating_signal(center, is_batchnorm=True, name="g1")
-    attn1 = attn_gating_block(conv4, g1, filters * 4, "_1")
+    attn1 = attn_gating_block(conv4, g1, ch["inter_1"], "_1")
     up1 = layers.concatenate(
         [
             layers.Conv2DTranspose(
-                filters,
+                ch["up1_deconv"],
                 (3, 3),
                 strides=(2, 2),
                 padding="same",
@@ -171,11 +176,11 @@ def build_attention_unet(
     )
 
     g2 = unet_gating_signal(up1, is_batchnorm=True, name="g2")
-    attn2 = attn_gating_block(conv3, g2, filters * 2, "_2")
+    attn2 = attn_gating_block(conv3, g2, ch["inter_2"], "_2")
     up2 = layers.concatenate(
         [
             layers.Conv2DTranspose(
-                filters * 2,
+                ch["up2_deconv"],
                 (3, 3),
                 strides=(2, 2),
                 padding="same",
@@ -189,11 +194,11 @@ def build_attention_unet(
 
     # g3 uses up1 as in the original reference notebook code.
     g3 = unet_gating_signal(up1, is_batchnorm=True, name="g3")
-    attn3 = attn_gating_block(conv2, g3, filters, "_3")
+    attn3 = attn_gating_block(conv2, g3, ch["inter_3"], "_3")
     up3 = layers.concatenate(
         [
             layers.Conv2DTranspose(
-                filters,
+                ch["up3_deconv"],
                 (3, 3),
                 strides=(2, 2),
                 padding="same",
@@ -208,7 +213,7 @@ def build_attention_unet(
     up4 = layers.concatenate(
         [
             layers.Conv2DTranspose(
-                filters,
+                ch["up4_deconv"],
                 (3, 3),
                 strides=(2, 2),
                 padding="same",

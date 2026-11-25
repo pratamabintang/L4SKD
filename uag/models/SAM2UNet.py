@@ -1,7 +1,32 @@
+import sys
+from pathlib import Path
+
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sam2.build_sam import build_sam2
+
+
+SAM2_CFG_ALIASES = {
+    "t": "sam2_hiera_t.yaml",
+    "s": "sam2_hiera_s.yaml",
+    "b+": "sam2_hiera_b+.yaml",
+    "l": "sam2_hiera_l.yaml",
+}
+
+
+def resolve_sam2_cfg(name: str) -> str:
+    """Resolve a short SAM2 backbone alias or config name to a YAML filename."""
+    key = name.strip()
+    if key.lower() in SAM2_CFG_ALIASES:
+        return SAM2_CFG_ALIASES[key.lower()]
+    if not key.endswith((".yaml", ".yml")):
+        return f"{key}.yaml"
+    return key
 
 
 class DoubleConv(nn.Module):
@@ -22,8 +47,8 @@ class DoubleConv(nn.Module):
 
     def forward(self, x):
         return self.double_conv(x)
-    
-    
+
+
 class Up(nn.Module):
     """Upscaling then double conv"""
 
@@ -65,7 +90,7 @@ class Adapter(nn.Module):
         promped = x + prompt
         net = self.block(promped)
         return net
-    
+
 
 class BasicConv2d(nn.Module):
     def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1):
@@ -80,7 +105,7 @@ class BasicConv2d(nn.Module):
         x = self.conv(x)
         x = self.bn(x)
         return x
-    
+
 
 class RFB_modified(nn.Module):
     def __init__(self, in_channel, out_channel):
@@ -122,13 +147,24 @@ class RFB_modified(nn.Module):
 
 
 class SAM2UNet(nn.Module):
-    def __init__(self, checkpoint_path=None) -> None:
-        super(SAM2UNet, self).__init__()    
-        model_cfg = "sam2_hiera_l.yaml"
-        if checkpoint_path:
-            model = build_sam2(model_cfg, checkpoint_path)
-        else:
-            model = build_sam2(model_cfg)
+    def __init__(
+        self,
+        checkpoint_path=None,
+        model_cfg: str = "sam2_hiera_l.yaml",
+        input_size: int | None = 352,
+        device: str = "cpu",
+    ) -> None:
+        super(SAM2UNet, self).__init__()
+        if input_size is not None:
+            input_size = int(input_size)
+            if input_size <= 0 or input_size % 32 != 0:
+                raise ValueError(
+                    f"input_size must be positive and divisible by 32, got {input_size}."
+                )
+        self.input_size = input_size
+        self.model_cfg = resolve_sam2_cfg(model_cfg)
+
+        model = build_sam2(self.model_cfg, checkpoint_path or None, device=device)
         del model.sam_mask_decoder
         del model.sam_prompt_encoder
         del model.memory_encoder
@@ -138,6 +174,8 @@ class SAM2UNet(nn.Module):
         del model.obj_ptr_proj
         del model.image_encoder.neck
         self.encoder = model.image_encoder.trunk
+
+        c1, c2, c3, c4 = self.encoder.channel_list[::-1]
 
         for param in self.encoder.parameters():
             param.requires_grad = False
@@ -149,10 +187,10 @@ class SAM2UNet(nn.Module):
         self.encoder.blocks = nn.Sequential(
             *blocks
         )
-        self.rfb1 = RFB_modified(144, 64)
-        self.rfb2 = RFB_modified(288, 64)
-        self.rfb3 = RFB_modified(576, 64)
-        self.rfb4 = RFB_modified(1152, 64)
+        self.rfb1 = RFB_modified(c1, 64)
+        self.rfb2 = RFB_modified(c2, 64)
+        self.rfb3 = RFB_modified(c3, 64)
+        self.rfb4 = RFB_modified(c4, 64)
         self.up1 = (Up(128, 64))
         self.up2 = (Up(128, 64))
         self.up3 = (Up(128, 64))
@@ -162,6 +200,15 @@ class SAM2UNet(nn.Module):
         self.head = nn.Conv2d(64, 1, kernel_size=1)
 
     def forward(self, x):
+        h, w = x.shape[-2:]
+        if self.input_size is not None and (h, w) != (self.input_size, self.input_size):
+            x = F.interpolate(
+                x,
+                size=(self.input_size, self.input_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+
         x1, x2, x3, x4 = self.encoder(x)
         x1, x2, x3, x4 = self.rfb1(x1), self.rfb2(x2), self.rfb3(x3), self.rfb4(x4)
         x = self.up1(x4, x3)
@@ -170,12 +217,17 @@ class SAM2UNet(nn.Module):
         out2 = F.interpolate(self.side2(x), scale_factor=8, mode='bilinear')
         x = self.up3(x, x1)
         out = F.interpolate(self.head(x), scale_factor=4, mode='bilinear')
+
+        if out.shape[-2:] != (h, w):
+            out = F.interpolate(out, size=(h, w), mode="bilinear", align_corners=False)
+            out1 = F.interpolate(out1, size=(h, w), mode="bilinear", align_corners=False)
+            out2 = F.interpolate(out2, size=(h, w), mode="bilinear", align_corners=False)
         return out, out1, out2
 
 
 if __name__ == "__main__":
     with torch.no_grad():
-        model = SAM2UNet().cuda()
-        x = torch.randn(1, 3, 352, 352).cuda()
+        model = SAM2UNet(model_cfg="sam2_hiera_t.yaml", input_size=128, device="cpu")
+        x = torch.randn(1, 3, 128, 128)
         out, out1, out2 = model(x)
         print(out.shape, out1.shape, out2.shape)

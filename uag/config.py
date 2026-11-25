@@ -46,6 +46,18 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help="Probability threshold for binary segmentation metrics.",
     )
     parser.add_argument(
+        "--iou-tau",
+        type=float,
+        default=0.5,
+        help="Tolerant IoU threshold tau for Family 1 region sufficiency.",
+    )
+    parser.add_argument(
+        "--dilation-alpha",
+        type=float,
+        default=0.1,
+        help="Size-scaled dilation factor alpha for Family 1 region sufficiency.",
+    )
+    parser.add_argument(
         "--model",
         choices=["attention_unet", "unet", "dual_branch"],
         default="attention_unet",

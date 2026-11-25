@@ -98,6 +98,74 @@ def structure_loss(y_true, y_pred, kernel_size: int = 31, edge_weight: float = 5
     return tf.reduce_mean(wbce + wiou)
 
 
+def _pearson(a, b, eps: float = 1e-8):
+    a_centered = a - tf.reduce_mean(a, axis=1, keepdims=True)
+    b_centered = b - tf.reduce_mean(b, axis=1, keepdims=True)
+    num = tf.reduce_sum(a_centered * b_centered, axis=1)
+    norm_a = tf.sqrt(tf.reduce_sum(tf.square(a_centered), axis=1) + 1e-12)
+    norm_b = tf.sqrt(tf.reduce_sum(tf.square(b_centered), axis=1) + 1e-12)
+    return num / (norm_a * norm_b + eps)
+
+
+def dist_loss_binary(
+    student_prob,
+    teacher_logit,
+    tau: float = 1.0,
+    beta: float = 1.0,
+    gamma: float = 1.0,
+    eps: float = 1e-6,
+):
+    """Output-level DIST knowledge distillation loss for binary segmentation."""
+    student_prob = tf.cast(student_prob, tf.float32)
+    teacher_logit = tf.cast(teacher_logit, tf.float32)
+
+    p = tf.clip_by_value(student_prob, eps, 1.0 - eps)
+    z_s = tf.math.log(p) - tf.math.log1p(-p)
+    zeros = tf.zeros_like(z_s)
+
+    tau_f = float(tau)
+    logits_s = tf.reshape(tf.concat([zeros, z_s], axis=-1) / tau_f, [-1, 2])
+    logits_t = tf.reshape(tf.concat([zeros, teacher_logit], axis=-1) / tau_f, [-1, 2])
+
+    y_s = tf.nn.softmax(logits_s, axis=-1)
+    y_t = tf.nn.softmax(logits_t, axis=-1)
+
+    inter = 1.0 - tf.reduce_mean(_pearson(y_s, y_t))
+    intra = 1.0 - tf.reduce_mean(_pearson(tf.transpose(y_s), tf.transpose(y_t)))
+    return (tau_f ** 2) * (float(beta) * inter + float(gamma) * intra)
+
+
+def make_kd_loss(
+    task_loss_name: str,
+    kd_weight: float = 1.0,
+    tau: float = 1.0,
+    beta: float = 1.0,
+    gamma: float = 1.0,
+):
+    """Build combined task + DIST KD loss and monitoring metric functions."""
+    base_loss_fn = get_loss(task_loss_name)
+    kd_w = float(kd_weight)
+
+    def kd_total_loss(y_true, y_pred):
+        mask = y_true[..., :1]
+        teacher_logit = y_true[..., 1:2]
+        t_loss = tf.reduce_mean(base_loss_fn(mask, y_pred))
+        d_loss = dist_loss_binary(y_pred, teacher_logit, tau=tau, beta=beta, gamma=gamma)
+        return t_loss + kd_w * d_loss
+
+    def task_loss(y_true, y_pred):
+        mask = y_true[..., :1]
+        return tf.reduce_mean(base_loss_fn(mask, y_pred))
+
+    def kd_loss(y_true, y_pred):
+        teacher_logit = y_true[..., 1:2]
+        return dist_loss_binary(y_pred, teacher_logit, tau=tau, beta=beta, gamma=gamma)
+
+    task_loss.__name__ = "task_loss"
+    kd_loss.__name__ = "kd_loss"
+    return kd_total_loss, [task_loss, kd_loss]
+
+
 def get_loss(name: str):
     """Resolve a loss function by name."""
     losses = {

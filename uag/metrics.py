@@ -29,6 +29,7 @@ class _ConfusionMetric(keras.metrics.Metric):
         self.fn = self.add_weight(name="fn", shape=(), initializer="zeros")
 
     def update_state(self, y_true, y_pred, sample_weight=None) -> None:
+        y_true = y_true[..., :1]
         y_true_b = tf.cast(y_true >= 0.5, tf.float32)
         y_pred_b = tf.cast(y_pred >= self.threshold, tf.float32)
 

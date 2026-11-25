@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Any
+
+import h5py
 
 from uag.config import (
     IGNORED_KEYS,
@@ -15,14 +18,18 @@ from uag.config import (
 from uag.data.landslide4sense import (
     Landslide4SenseDataset,
     get_normalizer,
+    load_teacher_logits,
     make_tf_dataset,
 )
-from uag.losses import get_loss
+from uag.losses import get_loss, make_kd_loss
 from uag.metrics import get_metrics
 from uag.models import build_model
+from uag.pruning.hrank import estimate_model_stats
+from uag.region_metrics import EvaluationSuiteAccumulator
 from uag.utils import (
     collect_environment,
     ensure_dir,
+    load_json,
     parse_bands,
     plot_history,
     run_name,
@@ -89,6 +96,8 @@ def train(cfg: dict[str, Any]) -> dict[str, Any]:
     patience = int(cfg.get("patience", 30))
     loss_name = cfg.get("loss", "dice")
     threshold = float(cfg.get("threshold", 0.5))
+    iou_tau = float(cfg.get("iou_tau", 0.5))
+    dilation_alpha = float(cfg.get("dilation_alpha", 0.1))
 
     color_jitter = bool(cfg.get("color_jitter", True))
     color_brightness = float(cfg.get("color_brightness", 0.15))
@@ -98,6 +107,25 @@ def train(cfg: dict[str, Any]) -> dict[str, Any]:
     cache_opt: bool | str = (
         cfg["cache_file"] if cfg.get("cache_file") else bool(cfg.get("cache", False))
     )
+    teacher_dir = cfg.get("teacher_dir")
+    kd_enabled = bool(teacher_dir)
+    train_teacher_logits = None
+    val_teacher_logits = None
+    if kd_enabled:
+        teacher_path = Path(teacher_dir)
+        train_logits_path = teacher_path / "teacher_logits_train.h5"
+        val_logits_path = teacher_path / "teacher_logits_val.h5"
+        with h5py.File(train_logits_path, "r") as hf:
+            raw_teacher_bands = hf.attrs.get("bands")
+            teacher_bands = json.loads(raw_teacher_bands) if raw_teacher_bands else None
+            print(f"Teacher logits bands: {teacher_bands}")
+            if teacher_bands != bands:
+                print(
+                    f"Warning: teacher bands {teacher_bands} differ from student bands {bands}."
+                )
+        train_teacher_logits = load_teacher_logits(train_logits_path, train_ds_raw.ids)
+        val_teacher_logits = load_teacher_logits(val_logits_path, val_ds_raw.ids)
+
     train_tf_ds = make_tf_dataset(
         train_ds_raw,
         batch_size=batch_size,
@@ -109,6 +137,7 @@ def train(cfg: dict[str, Any]) -> dict[str, Any]:
         color_brightness=color_brightness,
         color_contrast=color_contrast,
         color_prob=color_prob,
+        teacher_logits=train_teacher_logits,
     )
     val_tf_ds = make_tf_dataset(
         val_ds_raw,
@@ -116,18 +145,38 @@ def train(cfg: dict[str, Any]) -> dict[str, Any]:
         shuffle=False,
         augment=False,
         cache=cache_opt,
+        teacher_logits=val_teacher_logits,
     )
 
-    name = cfg.get("run_name") or run_name(
-        filters=filters,
-        batch_size=batch_size,
-        lr=lr,
-        size=size,
-        model=model_name,
+    kd_weight = float(cfg.get("kd_weight", 1.0))
+    kd_tau = float(cfg.get("kd_tau", 1.0))
+    kd_beta = float(cfg.get("kd_beta", 1.0))
+    kd_gamma = float(cfg.get("kd_gamma", 1.0))
+    monitor = cfg.get("monitor") or ("val_task_loss" if kd_enabled else "val_loss")
+    monitor_mode = "min" if str(monitor).endswith("loss") else "max"
+
+    name = cfg.get("run_name") or (
+        ("kd_" if kd_enabled else "")
+        + run_name(
+            filters=filters,
+            batch_size=batch_size,
+            lr=lr,
+            size=size,
+            model=model_name,
+        )
     )
     run_dir = ensure_dir(Path(cfg.get("output_dir", "runs")) / name)
     plots_dir = ensure_dir(run_dir / "plots")
     weights_path = run_dir / "best.weights.h5"
+
+    raw_channel_cfg = cfg.get("channel_cfg")
+    if isinstance(raw_channel_cfg, (str, Path)):
+        channel_cfg = {str(k): int(v) for k, v in load_json(raw_channel_cfg).items()}
+    elif isinstance(raw_channel_cfg, dict):
+        channel_cfg = {str(k): int(v) for k, v in raw_channel_cfg.items()}
+    else:
+        channel_cfg = None
+    pretrained_weights = cfg.get("pretrained_weights") or None
 
     resolved_cfg = {
         **cfg,
@@ -135,16 +184,26 @@ def train(cfg: dict[str, Any]) -> dict[str, Any]:
         "bands": bands,
         "input_shape": list(input_shape),
         "filters": filters,
+        "channel_cfg": channel_cfg,
+        "pretrained_weights": pretrained_weights,
         "batch_size": batch_size,
         "lr": lr,
         "epochs": epochs,
         "patience": patience,
         "loss": loss_name,
         "threshold": threshold,
+        "iou_tau": iou_tau,
+        "dilation_alpha": dilation_alpha,
         "color_jitter": color_jitter,
         "color_brightness": color_brightness,
         "color_contrast": color_contrast,
         "color_prob": color_prob,
+        "teacher_dir": str(teacher_dir) if teacher_dir else None,
+        "kd_weight": kd_weight,
+        "kd_tau": kd_tau,
+        "kd_beta": kd_beta,
+        "kd_gamma": kd_gamma,
+        "monitor": monitor,
         "run_name": name,
         "run_dir": str(run_dir),
         "weights_path": str(weights_path),
@@ -164,26 +223,41 @@ def train(cfg: dict[str, Any]) -> dict[str, Any]:
         model_name,
         input_shape=input_shape,
         filters=filters,
+        pretrained_weights=pretrained_weights,
         bands=bands,
+        channel_cfg=channel_cfg,
     )
+    if kd_enabled:
+        loss_fn, kd_metrics = make_kd_loss(
+            loss_name,
+            kd_weight=kd_weight,
+            tau=kd_tau,
+            beta=kd_beta,
+            gamma=kd_gamma,
+        )
+        metrics = get_metrics(threshold=threshold) + kd_metrics
+    else:
+        loss_fn = get_loss(loss_name)
+        metrics = get_metrics(threshold=threshold)
+
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=lr),
-        loss=get_loss(loss_name),
-        metrics=get_metrics(threshold=threshold),
+        loss=loss_fn,
+        metrics=metrics,
     )
 
     callbacks = [
         keras.callbacks.ModelCheckpoint(
             filepath=str(weights_path),
-            monitor="val_loss",
-            mode="min",
+            monitor=monitor,
+            mode=monitor_mode,
             save_best_only=True,
             save_weights_only=True,
             verbose=1,
         ),
         keras.callbacks.EarlyStopping(
-            monitor="val_loss",
-            mode="min",
+            monitor=monitor,
+            mode=monitor_mode,
             patience=patience,
             restore_best_weights=True,
             verbose=1,
@@ -203,6 +277,8 @@ def train(cfg: dict[str, Any]) -> dict[str, Any]:
     }
     plot_history(history_dict, "f1_score", plots_dir / "f1_score.png")
     plot_history(history_dict, "loss", plots_dir / "loss.png")
+    plot_history(history_dict, "task_loss", plots_dir / "task_loss.png")
+    plot_history(history_dict, "kd_loss", plots_dir / "kd_loss.png")
 
     test_metrics: dict[str, float] | None = None
     if cfg.get("eval_test", False):
@@ -227,6 +303,7 @@ def train(cfg: dict[str, Any]) -> dict[str, Any]:
             filters=filters,
             pretrained_weights=str(weights_path),
             bands=bands,
+            channel_cfg=channel_cfg,
         )
         eval_model.compile(
             optimizer=keras.optimizers.Adam(learning_rate=lr),
@@ -235,6 +312,24 @@ def train(cfg: dict[str, Any]) -> dict[str, Any]:
         )
         raw_metrics = eval_model.evaluate(test_tf_ds, return_dict=True)
         test_metrics = {k: float(v) for k, v in raw_metrics.items()}
+        suite_acc = EvaluationSuiteAccumulator(
+            threshold=threshold,
+            tau=iou_tau,
+            alpha=dilation_alpha,
+        )
+        offset = 0
+        for batch_x, batch_y in test_tf_ds:
+            preds = eval_model(batch_x, training=False)
+            b_size = int(preds.shape[0]) if preds.shape[0] is not None else int(batch_y.shape[0])
+            batch_ids = test_ds_raw.ids[offset : offset + b_size]
+            suite_acc.update_batch(preds.numpy(), batch_y.numpy(), sample_ids=batch_ids)
+            offset += b_size
+        test_metrics.update(suite_acc.compute())
+        test_metrics["model_cost"] = {
+            **estimate_model_stats(eval_model),
+            "weights_size_mb": round(weights_path.stat().st_size / (1024 * 1024), 4),
+        }
+        suite_acc.save_per_patch_csv(run_dir / "per_patch_test.csv")
         save_json(test_metrics, run_dir / "test_metrics.json")
 
     return {
@@ -251,6 +346,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_args(parser)
     parser.add_argument("--train-list", default=None, help="Optional txt file filtering training sample IDs.")
     parser.add_argument("--filters", type=int, default=4, help="Base number of conv filters.")
+    parser.add_argument("--pretrained-weights", default=None, help="Optional .weights.h5 checkpoint to initialize weights.")
+    parser.add_argument("--channel-cfg", default=None, help="Optional JSON file mapping Attention U-Net unit names to channel counts.")
     parser.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate.")
     parser.add_argument("--batch-size", type=int, default=8, help="Training batch size.")
     parser.add_argument("--epochs", type=int, default=200, help="Maximum training epochs.")
