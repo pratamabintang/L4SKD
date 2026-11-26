@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import random
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -51,12 +52,23 @@ def _cfg_alias(sam2_cfg: str) -> str:
     return stem
 
 
+def _resolve_amp_dtype(use_amp: bool, device: str) -> tuple[bool, torch.dtype]:
+    """Use bfloat16 when supported on CUDA; disable float16 AMP to avoid SAM2 overflow."""
+    if not (use_amp and device.startswith("cuda")):
+        return False, torch.float32
+    if torch.cuda.is_bf16_supported():
+        return True, torch.bfloat16
+    print("Note: CUDA device lacks bfloat16 support; disabling float16 AMP to avoid SAM2-UNet overflow.")
+    return False, torch.float32
+
+
 def _evaluate_loader(
     model: torch.nn.Module,
     loader: DataLoader,
     device: str,
     threshold: float,
     use_amp: bool,
+    amp_dtype: torch.dtype = torch.float32,
     include_region_suite: bool = False,
     iou_tau: float = 0.5,
     dilation_alpha: float = 0.1,
@@ -82,7 +94,7 @@ def _evaluate_loader(
         for imgs, masks, idxs in loader:
             imgs = imgs.to(device)
             masks = masks.to(device)
-            with torch.amp.autocast("cuda", enabled=amp_enabled):
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
                 out, out1, out2 = model(imgs)
                 loss = (
                     structure_loss(out, masks)
@@ -122,7 +134,7 @@ def train_teacher(cfg: dict[str, Any]) -> dict[str, Any]:
     _set_torch_seed(seed)
 
     device = resolve_device(str(cfg.get("device", "auto")))
-    use_amp = bool(cfg.get("amp", False)) and device.startswith("cuda")
+    use_amp, amp_dtype = _resolve_amp_dtype(bool(cfg.get("amp", False)), device)
 
     bands = cfg.get("bands")
     if isinstance(bands, str):
@@ -236,7 +248,8 @@ def train_teacher(cfg: dict[str, Any]) -> dict[str, Any]:
     model = build_teacher(resolved_cfg, device=device)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     n_trainable = sum(p.numel() for p in trainable_params)
-    print(f"Trainable params: {n_trainable:,}")
+    amp_label = str(amp_dtype).replace("torch.", "") if use_amp else "disabled (float32)"
+    print(f"Trainable params: {n_trainable:,} | AMP: {amp_label}")
 
     optimizer = torch.optim.AdamW(
         trainable_params,
@@ -248,7 +261,7 @@ def train_teacher(cfg: dict[str, Any]) -> dict[str, Any]:
         T_max=max(epochs, 1),
         eta_min=1e-7,
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and amp_dtype == torch.float16)
 
     history_rows: list[dict[str, float]] = []
     train_losses: list[float] = []
@@ -264,12 +277,12 @@ def train_teacher(cfg: dict[str, Any]) -> dict[str, Any]:
         n_train_batches = 0
         current_lr = float(optimizer.param_groups[0]["lr"])
 
-        for imgs, masks, _ in train_loader:
+        for batch_idx, (imgs, masks, _) in enumerate(train_loader):
             imgs = imgs.to(device)
             masks = masks.to(device)
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.amp.autocast("cuda", enabled=use_amp):
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
                 out, out1, out2 = model(imgs)
                 loss = (
                     structure_loss(out, masks)
@@ -277,9 +290,21 @@ def train_teacher(cfg: dict[str, Any]) -> dict[str, Any]:
                     + structure_loss(out2, masks)
                 )
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            if not torch.isfinite(loss):
+                raise RuntimeError(
+                    f"Non-finite teacher loss ({loss.item()}) at epoch {epoch}, batch {batch_idx}."
+                )
+
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                optimizer.step()
 
             running_loss += float(loss.item())
             n_train_batches += 1
@@ -293,6 +318,7 @@ def train_teacher(cfg: dict[str, Any]) -> dict[str, Any]:
             device=device,
             threshold=threshold,
             use_amp=use_amp,
+            amp_dtype=amp_dtype,
         )
         val_loss = val_res["loss"]
         val_f1 = val_res["f1_score"]
@@ -318,7 +344,7 @@ def train_teacher(cfg: dict[str, Any]) -> dict[str, Any]:
             f"- val_f1: {val_f1:.4f} - val_iou: {val_res['iou']:.4f}"
         )
 
-        if val_f1 > best_val_f1:
+        if math.isfinite(val_loss) and val_f1 > best_val_f1:
             best_val_f1 = val_f1
             epochs_without_improve = 0
             torch.save(trainable_state_dict(model), weights_path)
@@ -369,6 +395,7 @@ def train_teacher(cfg: dict[str, Any]) -> dict[str, Any]:
         device=device,
         threshold=threshold,
         use_amp=use_amp,
+        amp_dtype=amp_dtype,
         include_region_suite=True,
         iou_tau=iou_tau,
         dilation_alpha=dilation_alpha,
@@ -401,6 +428,7 @@ def train_teacher(cfg: dict[str, Any]) -> dict[str, Any]:
             device=device,
             threshold=threshold,
             use_amp=use_amp,
+            amp_dtype=amp_dtype,
             include_region_suite=True,
             iou_tau=iou_tau,
             dilation_alpha=dilation_alpha,
